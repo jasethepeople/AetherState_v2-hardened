@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  # -----------------------------------------------------------------------------
+  # Redis — Hot cache for document state and real-time sync
+  # -----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: aetherstate-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------------
+  # PostgreSQL — Durable persistence for document snapshots and operation history
+  # -----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: aetherstate-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: aetherstate
+      POSTGRES_PASSWORD: aetherstate_secret
+      POSTGRES_DB: aetherstate
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherstate -d aetherstate"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------------
+  # MCP Server — JWT-authenticated API gateway
+  # -----------------------------------------------------------------------------
+  mcp-server:
+    build: .
+    container_name: aetherstate-mcp
+    ports:
+      - "3000:3000"
+    environment:
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://aetherstate:aetherstate_secret@postgres:5432/aetherstate
+      - MCP_PORT=3000
+      - LOG_LEVEL=info
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+      - RATE_LIMIT_MAX_REQUESTS=60
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: npm run start:mcp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # -----------------------------------------------------------------------------
+  # Bridge Server — CRDT state management with dual persistence
+  # -----------------------------------------------------------------------------
+  bridge-server:
+    build: .
+    container_name: aetherstate-bridge
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://aetherstate:aetherstate_secret@postgres:5432/aetherstate
+      - BRIDGE_PORT=8080
+      - LOG_LEVEL=info
+      - DOC_TTL=1800000
+      - MAX_DOC_SIZE=10000
+      - SNAPSHOT_INTERVAL=300000
+      - ENABLE_EMBEDDING=${ENABLE_EMBEDDING:-true}
+      - POSTGRES_POOL_SIZE=10
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: npm run start:bridge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # -----------------------------------------------------------------------------
+  # Signaling Server — WebRTC peer discovery and NAT traversal
+  # -----------------------------------------------------------------------------
+  signaling-server:
+    build: .
+    container_name: aetherstate-signaling
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+    environment:
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - SIGNALING_PORT=8081
+      - METRICS_PORT=8082
+      - LOG_LEVEL=info
+      - HEARTBEAT_INTERVAL=30000
+      - PEER_TIMEOUT=120000
+      - MAX_PEERS_PER_DOC=50
+      - ENABLE_METRICS=${ENABLE_METRICS:-true}
+      - ENABLE_CELLULAR_MESH=${ENABLE_CELLULAR_MESH:-false}
+      - CELLULAR_MESH_SIZE=${CELLULAR_MESH_SIZE:-8}
+    command: npm run start:signaling
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
