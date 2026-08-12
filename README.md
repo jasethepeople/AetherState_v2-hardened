@@ -1,5 +1,7 @@
 # AetherState
 
+https://youtube.com/shorts/sJLUGgCedmg?si=toPAhZeEPosLyvKL
+
 > **AetherState** is a real-time collaborative platform that enables Conflict-free Replicated Data Type (CRDT) based synchronization between human users and AI agents across distributed edge nodes. It combines WebRTC peer-to-peer mesh networking, dual-tier persistence (Redis hot-cache + PostgreSQL durable store), and JWT-based access control to provide a production-grade infrastructure for human-AI collaborative editing.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
