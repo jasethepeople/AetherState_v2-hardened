@@ -62,10 +62,11 @@ const mutateLimiter = rateLimit({
 });
 
 function validateJwtConfig(): string {
-    const publicKey = process.env.JWT_PUBLIC_KEY;
+    let publicKey = process.env.JWT_PUBLIC_KEY;
     if (!publicKey) {
         throw new Error('JWT_PUBLIC_KEY environment variable is required');
     }
+    publicKey = publicKey.replace(/\\n/g, '\n').trim();
     if (!publicKey.includes('BEGIN PUBLIC KEY') && !publicKey.includes('BEGIN RSA PUBLIC KEY')) {
         throw new Error('JWT_PUBLIC_KEY must be a valid PEM formatted public key');
     }

@@ -51,7 +51,7 @@ async function main() {
 
     const signaling = new AetherSignalingServer({
         port: parseInt(process.env.SIGNALING_PORT || '8081'),
-        jwtPublicKey: process.env.JWT_PUBLIC_KEY!,
+        jwtPublicKey: (process.env.JWT_PUBLIC_KEY || '').replace(/\\n/g, '\n').trim(),
         heartbeatInterval: parseInt(process.env.WS_HEARTBEAT_INTERVAL || '30000'),
         peerTimeout: parseInt(process.env.PEER_TIMEOUT || '120000'),
         maxPeersPerDoc: parseInt(process.env.MAX_PEERS_PER_DOC || '50'),

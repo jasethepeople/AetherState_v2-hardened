@@ -1,5 +1,5 @@
 import { BaseCallbackHandler } from 'langchain/callbacks';
-import { Y.Doc, Map as YMap } from 'yjs';
+import * as Y from 'yjs';
 import winston from 'winston';
 
 const logger = winston.createLogger({
@@ -34,7 +34,7 @@ class CRDTCallbackHandler extends BaseCallbackHandler {
     private pathPrefix: string;
     private maxEntrySize: number;
     private maxHistoryEntries: number;
-    private yMap: YMap<any>;
+    private yMap: Y.Map<any>;
     private operationCount = 0;
 
     constructor(config: CRDTCallbackConfig) {

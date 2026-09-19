@@ -485,7 +485,7 @@ class AetherSignalingServer {
 }
 
 if (require.main === module) {
-    const jwtPublicKey = process.env.JWT_PUBLIC_KEY;
+    const jwtPublicKey = (process.env.JWT_PUBLIC_KEY || '').replace(/\\n/g, '\n').trim();
     if (!jwtPublicKey) {
         console.error('JWT_PUBLIC_KEY environment variable required');
         process.exit(1);
