@@ -45,13 +45,20 @@ class CRDTCallbackHandler extends BaseCallbackHandler {
         this.maxEntrySize = config.maxEntrySize || 1024 * 1024;
         this.maxHistoryEntries = config.maxHistoryEntries || 1000;
 
-        const rootMap = this.doc.getMap('agents');
+        const rootMap = this.doc.getMap(this.pathPrefix);
         if (!rootMap.has(this.agentId)) {
-            rootMap.set(this.agentId, new Y.Doc());
+            // NOTE (review 2026-10-02): this used to store a nested Y.Doc here,
+            // but Yjs subdocuments do NOT replicate their content with the
+            // parent doc's updates — the history was silently lost on sync
+            // (verified empirically). A nested Y.Map replicates correctly.
+            rootMap.set(this.agentId, new Y.Map());
         }
 
-        const agentDoc = rootMap.get(this.agentId) as Y.Doc;
-        this.yMap = agentDoc.getMap('history');
+        const agentMap = rootMap.get(this.agentId) as Y.Map<any>;
+        if (!agentMap.has('history')) {
+            agentMap.set('history', new Y.Map());
+        }
+        this.yMap = agentMap.get('history') as Y.Map<any>;
     }
 
     async onChainStart(serialized: any, inputs: any): Promise<void> {
@@ -212,7 +219,17 @@ class CRDTCallbackHandler extends BaseCallbackHandler {
     }
 
     private safeSerialize(data: any): SafeSerializationResult {
-        const originalSize = JSON.stringify(data).length;
+        // NOTE (review 2026-10-02): originalSize is best-effort — a plain
+        // JSON.stringify throws on circular input, so it must not gate the
+        // circular-safe serialization below (previously it threw before the
+        // try, bypassing the '[Circular Reference]' fallback entirely).
+        let originalSize = -1;
+        try {
+            originalSize = JSON.stringify(data).length;
+        } catch {
+            // Circular or otherwise unserializable: the safe path below
+            // handles it; size stays unknown (-1).
+        }
 
         try {
             const seen = new WeakSet();
@@ -257,7 +274,7 @@ class CRDTCallbackHandler extends BaseCallbackHandler {
                     keys: Object.keys(data || {})
                 }),
                 wasTruncated: true,
-                originalSize
+                originalSize: -1
             };
         }
     }

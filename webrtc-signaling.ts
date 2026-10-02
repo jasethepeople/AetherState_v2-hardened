@@ -21,6 +21,9 @@ interface Peer {
     lastSeen: number;
     metadata: Record<string, any>;
     connectedPeers: Set<string>;
+    // The JWT subject (human/agent identity). Distinct from `id`, which is
+    // always server-generated — see the connection handler.
+    actorId: string;
 }
 
 interface SignalMessage {
@@ -44,6 +47,7 @@ interface SignalingConfig {
 
 class AetherSignalingServer {
     private wss: WebSocketServer;
+    private httpServer: ReturnType<typeof createServer>;
     private peers: Map<string, Peer> = new Map();
     private docPeers: Map<string, Set<string>> = new Map();
     private config: SignalingConfig;
@@ -64,6 +68,7 @@ class AetherSignalingServer {
         };
 
         const server = createServer();
+        this.httpServer = server;
         this.wss = new WebSocketServer({ server });
 
         this.setupWebSocketHandlers();
@@ -93,14 +98,20 @@ class AetherSignalingServer {
                 return;
             }
 
-            const peerId = claims.sub || randomUUID();
+            // NOTE (review 2026-10-02): peer IDs are ALWAYS server-generated.
+            // Previously the JWT `sub` was used as the map key, so a second
+            // connection with the same `sub` overwrote the first peer entry
+            // and the first socket's close handler then disconnected the
+            // second peer (session confusion). `sub` is kept as `actorId`.
+            const peerId = randomUUID();
             const peer: Peer = {
                 id: peerId,
                 ws,
                 docIds: new Set(),
                 lastSeen: Date.now(),
                 metadata: claims,
-                connectedPeers: new Set()
+                connectedPeers: new Set(),
+                actorId: claims.sub || 'anonymous'
             };
 
             this.peers.set(peerId, peer);
@@ -479,7 +490,12 @@ class AetherSignalingServer {
             peer.ws.close(1000, 'Server shutting down');
         });
 
-        this.wss.close();
+        // NOTE (review 2026-10-02): the underlying HTTP server must be closed
+        // too — wss.close() alone leaves the socket bound and the event loop
+        // alive.
+        this.wss.close(() => {
+            this.httpServer.close();
+        });
         logger.info('Signaling server shut down');
     }
 }

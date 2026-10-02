@@ -1,11 +1,14 @@
 import express, { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import cors from 'cors';
 import { z } from 'zod';
 import winston from 'winston';
-import { WebSocketPool } from './websocket-pool';
+import fs from 'fs';
+import { verifyDocAccess, AuthenticatedRequest } from './auth';
+
+// Winston file transports do not create their directory — ensure it exists.
+fs.mkdirSync('logs', { recursive: true });
 
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -21,18 +24,6 @@ const logger = winston.createLogger({
         new winston.transports.File({ filename: 'logs/combined.log' })
     ]
 });
-
-interface DocClaims {
-    sub: string;
-    docIds: string[];
-    iat: number;
-    exp: number;
-}
-
-interface AuthenticatedRequest extends Request {
-    actorId?: string;
-    claims?: DocClaims;
-}
 
 const mutateSchema = z.object({
     key: z.string().min(1).max(256).regex(/^[a-zA-Z0-9_\/\-\.]+$/),
@@ -61,67 +52,51 @@ const mutateLimiter = rateLimit({
     standardHeaders: true,
 });
 
-function validateJwtConfig(): string {
-    let publicKey = process.env.JWT_PUBLIC_KEY;
-    if (!publicKey) {
-        throw new Error('JWT_PUBLIC_KEY environment variable is required');
+// NOTE (review 2026-10-02): mutations are forwarded to the bridge over HTTP.
+// The bridge exposes POST /mutate and GET /docs/:docId; the previous code
+// tried to reach it through a WebSocket pool aimed at the bridge's HTTP-only
+// port, with the pool handle read from the wrong object (req instead of the
+// app) — every mutation failed. HTTP forwarding uses the API the bridge
+// actually speaks.
+const BRIDGE_URL = (process.env.BRIDGE_URL || 'http://localhost:8080').replace(/\/$/, '');
+
+class BridgeError extends Error {
+    statusCode: number;
+    constructor(statusCode: number, message: string) {
+        super(message);
+        this.statusCode = statusCode;
     }
-    publicKey = publicKey.replace(/\\n/g, '\n').trim();
-    if (!publicKey.includes('BEGIN PUBLIC KEY') && !publicKey.includes('BEGIN RSA PUBLIC KEY')) {
-        throw new Error('JWT_PUBLIC_KEY must be a valid PEM formatted public key');
-    }
-    return publicKey;
 }
 
-const JWT_PUBLIC_KEY = validateJwtConfig();
-
-async function verifyDocAccess(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader?.startsWith('Bearer ')) {
-        logger.warn('Missing or invalid authorization header', {
-            ip: req.ip,
-            path: req.path,
-            docId: req.params.docId
-        });
-        return res.status(401).json({ error: 'Missing bearer token' });
-    }
-
-    const token = authHeader.slice(7);
-    let claims: DocClaims;
-
+async function forwardToBridge(path: string, body: any | undefined, authHeader?: string): Promise<any> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
-        claims = jwt.verify(token, JWT_PUBLIC_KEY, {
-            algorithms: ['RS256'],
-            clockTolerance: 30
-        }) as DocClaims;
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        // Ruling 2026-10-02 (H1): the bridge enforces RS256 auth itself
+        // (defense in depth — its port is published). Forward the caller's
+        // original Authorization header so the bridge sees the end-user's
+        // token, not an MCP-service identity.
+        if (authHeader) {
+            headers['Authorization'] = authHeader;
+        }
+        const resp = await fetch(`${BRIDGE_URL}${path}`, {
+            method: body ? 'POST' : 'GET',
+            headers,
+            body: body ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+        });
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => '');
+            throw new BridgeError(resp.status, `Bridge request failed: ${resp.status} ${text}`.trim());
+        }
+        return await resp.json();
     } catch (err) {
-        logger.warn('JWT verification failed', {
-            ip: req.ip,
-            error: err instanceof Error ? err.message : 'Unknown error',
-            docId: req.params.docId
-        });
-        return res.status(401).json({ error: 'Invalid or expired token' });
+        if (err instanceof BridgeError) throw err;
+        throw new BridgeError(502, `Bridge unreachable: ${(err as Error).message}`);
+    } finally {
+        clearTimeout(timer);
     }
-
-    if (!claims.sub || !Array.isArray(claims.docIds)) {
-        logger.warn('Malformed JWT claims', { ip: req.ip, docId: req.params.docId });
-        return res.status(401).json({ error: 'Malformed token claims' });
-    }
-
-    const { docId } = req.params;
-    if (!claims.docIds.includes('*') && !claims.docIds.includes(docId)) {
-        logger.warn('Unauthorized document access attempt', {
-            actorId: claims.sub,
-            docId,
-            allowedDocs: claims.docIds
-        });
-        return res.status(403).json({ error: 'Not authorized for this document' });
-    }
-
-    req.actorId = claims.sub;
-    req.claims = claims;
-    next();
 }
 
 function auditLog(action: string) {
@@ -150,6 +125,12 @@ function errorHandler(err: Error, req: Request, res: Response, _next: NextFuncti
         path: req.path,
         method: req.method
     });
+    // NOTE (review 2026-10-02): bridge failures carry their own status
+    // (502 unreachable, 404 from the bridge, ...). Only truly unknown errors
+    // become opaque 500s.
+    if (err instanceof BridgeError) {
+        return res.status(err.statusCode).json({ error: err.message });
+    }
     res.status(500).json({ error: 'Internal server error' });
 }
 
@@ -182,7 +163,7 @@ mcpServer.get('/health', (req, res) => {
     });
 });
 
-mcpServer.get('/metrics', (req, res) => {
+mcpServer.get('/metrics', verifyDocAccess(() => '*'), (req, res) => {
     res.json({
         uptime: process.uptime(),
         memory: process.memoryUsage(),
@@ -190,12 +171,15 @@ mcpServer.get('/metrics', (req, res) => {
     });
 });
 
+// NOTE (review 2026-10-02): verifyDocAccess runs BEFORE mutateLimiter so the
+// limiter's keyGenerator actually sees req.actorId (per-actor limiting per
+// ADR-005). Previously the limiter ran first and always fell back to IP.
 mcpServer.post(
     '/docs/:docId/mutate',
+    verifyDocAccess(req => req.params.docId),
     mutateLimiter,
-    verifyDocAccess,
     auditLog('DOCUMENT_MUTATE'),
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
         try {
             const validated = mutateSchema.parse(req.body);
             const { key, value } = validated;
@@ -204,18 +188,14 @@ mcpServer.post(
 
             logger.info('Processing mutation', { docId, key, actorId });
 
-            const bridgePool = (req as any).bridgePool as WebSocketPool;
-            if (!bridgePool) {
-                throw new Error('Bridge pool not configured');
-            }
-
-            const bridge = await bridgePool.acquire();
-            try {
-                await sendToBridge(bridge, docId, key, value, actorId);
-                res.json({ status: 'accepted', docId, key, actorId });
-            } finally {
-                bridgePool.release(bridge);
-            }
+            const result = await forwardToBridge('/mutate', {
+                docId,
+                key,
+                value,
+                actorId,
+                timestamp: Date.now(),
+            }, req.headers.authorization);
+            res.json({ status: 'accepted', docId, key, actorId, opId: result?.opId });
         } catch (err) {
             if (err instanceof z.ZodError) {
                 logger.warn('Validation failed', { errors: err.errors });
@@ -224,48 +204,47 @@ mcpServer.post(
                     details: err.errors
                 });
             }
-            throw err;
+            // Express 4 does not catch async rejections — hand them to the
+            // centralized error handler explicitly.
+            next(err);
         }
     }
 );
 
 mcpServer.get(
     '/docs/:docId',
-    verifyDocAccess,
+    verifyDocAccess(req => req.params.docId),
     auditLog('DOCUMENT_READ'),
-    async (req: AuthenticatedRequest, res: Response) => {
-        const { docId } = req.params;
-        res.json({
-            docId,
-            status: 'active',
-        });
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            // NOTE (review 2026-10-02): this used to return a stub
+            // { docId, status: 'active' }. Proxy the bridge's real endpoint.
+            const doc = await forwardToBridge(
+                `/docs/${encodeURIComponent(req.params.docId)}`,
+                undefined,
+                req.headers.authorization
+            );
+            res.json(doc);
+        } catch (err) {
+            if (err instanceof BridgeError && err.statusCode === 404) {
+                return res.status(404).json({ error: 'Document not found' });
+            }
+            next(err);
+        }
     }
 );
 
-async function sendToBridge(
-    bridge: any,
-    docId: string,
-    key: string,
-    value: any,
-    actorId: string
-): Promise<void> {
-    return new Promise((resolve, reject) => {
-        const message = JSON.stringify({
-            type: 'mutate',
-            docId,
-            key,
-            value,
-            actorId,
-            timestamp: Date.now()
-        });
+mcpServer.use(errorHandler);
 
-        bridge.send(message, (err: Error | undefined) => {
-            if (err) reject(err);
-            else resolve();
-        });
+// NOTE (review 2026-10-02): the module previously never called listen(), so
+// `npm run start:mcp` (used by docker-compose) started a process that did
+// nothing and exited. Standalone boot only when run directly; index.ts
+// manages the app itself when orchestrating.
+if (require.main === module) {
+    const port = parseInt(process.env.MCP_PORT || '3000');
+    mcpServer.listen(port, () => {
+        logger.info(`MCP Server listening on port ${port}`);
     });
 }
-
-mcpServer.use(errorHandler);
 
 export { mcpServer, logger };

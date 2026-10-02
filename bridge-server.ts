@@ -1,9 +1,15 @@
-import express, { Request, Response } from 'express';
+import express, { Response } from 'express';
 import { createClient, RedisClientType } from 'redis';
 import { Pool, PoolClient } from 'pg';
 import { EventEmitter } from 'events';
 import winston from 'winston';
 import * as Y from 'yjs';
+import fs from 'fs';
+import { verifyDocAccess, AuthenticatedRequest } from './auth';
+
+// Winston file transports do not create their directory — ensure it exists
+// (the Dockerfile creates logs/, plain `npm start` does not).
+fs.mkdirSync('logs', { recursive: true });
 
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -132,7 +138,6 @@ class AetherBridge extends EventEmitter {
                     op_key VARCHAR(512) NOT NULL,
                     op_value JSONB,
                     idempotency_key VARCHAR(255) UNIQUE,
-                    embedding VECTOR(1536),
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             `);
@@ -212,17 +217,22 @@ class AetherBridge extends EventEmitter {
         const redisData = await this.redis.get(`aetherstate:doc:${docId}`);
         const doc = new Y.Doc();
 
+        // NOTE (review 2026-10-02): a corrupt Redis entry must not shadow the
+        // durable Postgres copy — fall through to Postgres when Redis data
+        // exists but fails to apply.
+        let loaded = false;
         if (redisData) {
             try {
                 const buffer = Buffer.from(redisData, 'base64');
                 Y.applyUpdate(doc, new Uint8Array(buffer));
+                loaded = true;
                 logger.info('Document loaded from Redis', { docId });
             } catch (err) {
-                logger.warn('Redis load failed, trying PostgreSQL', { docId });
+                logger.warn('Redis data corrupt, trying PostgreSQL', { docId });
             }
         }
 
-        if (!redisData) {
+        if (!loaded) {
             try {
                 const client = await this.pgPool.connect();
                 try {
@@ -457,9 +467,17 @@ const bridge = new AetherBridge({
     postgresPoolSize: parseInt(process.env.POSTGRES_POOL_SIZE || '10')
 });
 
-app.post('/mutate', async (req: Request, res: Response) => {
+// Ruling 2026-10-02 (H1): the bridge enforces the same RS256 document auth
+// as the MCP server (ADR-004, defense in depth — the bridge port is
+// published). The MCP forwards the caller's Authorization header, so the
+// bridge always sees the end-user's token.
+app.post('/mutate', verifyDocAccess(req => (req.body as MutationRequest)?.docId), async (req: AuthenticatedRequest, res: Response) => {
     try {
-        const result = await bridge.mutate(req.body as MutationRequest);
+        const body = req.body as MutationRequest;
+        // The token was just verified: attribute the operation to the
+        // token's subject rather than trusting the body's actorId, which a
+        // direct caller could forge.
+        const result = await bridge.mutate({ ...body, actorId: req.actorId ?? body.actorId });
         res.json(result);
     } catch (err) {
         logger.error('Mutate error', { error: (err as Error).message, body: req.body });
@@ -467,7 +485,7 @@ app.post('/mutate', async (req: Request, res: Response) => {
     }
 });
 
-app.get('/docs/:docId', async (req: Request, res: Response) => {
+app.get('/docs/:docId', verifyDocAccess(req => req.params.docId), async (req: AuthenticatedRequest, res: Response) => {
     try {
         const doc = await bridge.getDocument(req.params.docId);
         if (!doc) {
@@ -480,7 +498,10 @@ app.get('/docs/:docId', async (req: Request, res: Response) => {
     }
 });
 
-app.get('/metrics', (req, res) => {
+// /metrics is not document-scoped, but it is privileged server telemetry:
+// the same RS256 middleware guards it, requiring the '*' wildcard claim
+// (one scheme, no drift — 2026-10-02 ruling).
+app.get('/metrics', verifyDocAccess(() => '*'), (req, res) => {
     res.json(bridge.getMetrics());
 });
 
@@ -504,9 +525,16 @@ async function start() {
     });
 }
 
-start().catch(err => {
-    logger.error('Failed to start bridge', { error: err.message });
-    process.exit(1);
-});
+// NOTE (review 2026-10-02): importing this module must NOT boot a second
+// bridge — index.ts imports it for the AetherBridge class and manages the
+// lifecycle itself. Standalone boot only when run directly.
+if (require.main === module) {
+    start().catch(err => {
+        logger.error('Failed to start bridge', { error: err.message });
+        process.exit(1);
+    });
+}
 
-export { AetherBridge, BridgeConfig, MutationRequest };
+// Exported for the orchestrator (index.ts): it initializes this same bridge
+// instance and serves its HTTP app, so there is exactly one bridge per process.
+export { AetherBridge, BridgeConfig, MutationRequest, bridge as bridgeInstance, app as bridgeApp };

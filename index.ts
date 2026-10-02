@@ -1,7 +1,11 @@
 import { mcpServer } from './mcp-server';
-import { AetherBridge } from './bridge-server';
+// NOTE (review 2026-10-02): bridge-server no longer boots on import; index.ts
+// initializes this same bridge instance and serves its HTTP app, so there is
+// exactly one bridge per process. (The old WebSocketPool wiring was removed:
+// mutations now go MCP -> bridge over HTTP, and the pool pointed at the
+// bridge's HTTP-only port.)
+import { bridgeInstance as bridge, bridgeApp } from './bridge-server';
 import { AetherSignalingServer } from './webrtc-signaling';
-import { WebSocketPool } from './websocket-pool';
 import winston from 'winston';
 import dotenv from 'dotenv';
 
@@ -26,28 +30,12 @@ async function main() {
         throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
     }
 
-    const bridgePool = new WebSocketPool({
-        maxPoolSize: parseInt(process.env.WS_POOL_MAX_SIZE || '50'),
-        uri: `ws://localhost:${process.env.BRIDGE_PORT || '8080'}`,
-        heartbeatInterval: parseInt(process.env.WS_HEARTBEAT_INTERVAL || '30000'),
-        connectionTimeout: parseInt(process.env.WS_CONNECTION_TIMEOUT || '10000'),
-        acquireTimeout: 5000,
-        maxConnectionAge: 300000,
-        reconnectAttempts: 3,
-        reconnectDelay: 1000
-    });
-
-    const bridge = new AetherBridge({
-        redisUrl: process.env.REDIS_URL!,
-        postgresUrl: process.env.POSTGRES_URL!,
-        docTTL: parseInt(process.env.DOC_TTL || '1800000'),
-        maxDocSize: parseInt(process.env.MAX_DOC_SIZE || '10000'),
-        snapshotInterval: parseInt(process.env.SNAPSHOT_INTERVAL || '300000'),
-        enableEmbedding: process.env.ENABLE_EMBEDDING !== 'false',
-        postgresPoolSize: parseInt(process.env.POSTGRES_POOL_SIZE || '10')
-    });
-
     await bridge.initialize();
+
+    const bridgePort = parseInt(process.env.BRIDGE_PORT || '8080');
+    bridgeApp.listen(bridgePort, () => {
+        logger.info(`Bridge server running on port ${bridgePort}`);
+    });
 
     const signaling = new AetherSignalingServer({
         port: parseInt(process.env.SIGNALING_PORT || '8081'),
@@ -63,7 +51,10 @@ async function main() {
     signaling.startHeartbeat();
     signaling.startCleanup();
 
-    (mcpServer as any).bridgePool = bridgePool;
+    // (mcpServer as any).bridgePool wiring removed 2026-10-02: the MCP server
+    // now forwards mutations to the bridge over HTTP (BRIDGE_URL); the pool
+    // handle was read from the wrong object and the pool targeted an
+    // HTTP-only port, so every mutation failed.
 
     const mcpPort = parseInt(process.env.MCP_PORT || '3000');
     mcpServer.listen(mcpPort, () => {
@@ -75,7 +66,6 @@ async function main() {
 
         await bridge.shutdown();
         signaling.shutdown();
-        await bridgePool.shutdown();
 
         logger.info('Shutdown complete');
         process.exit(0);
@@ -83,6 +73,9 @@ async function main() {
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('unhandledRejection', (reason) => {
+        logger.error('Unhandled promise rejection', { reason });
+    });
 
     logger.info('AetherState v2.0 is running');
 }

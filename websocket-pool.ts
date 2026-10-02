@@ -49,6 +49,11 @@ class WebSocketPool extends EventEmitter {
     private heartbeatTimers: Map<WebSocket, NodeJS.Timeout> = new Map();
     private isShuttingDown = false;
     private lastPongTimestamps: Map<WebSocket, number> = new Map();
+    // NOTE (review 2026-10-02): destroyConnection() was reachable twice for one
+    // socket (acquire-catch + 'close' event; remote close + later release),
+    // driving currentTotalConnections negative and defeating the pool-size
+    // guard. Destruction is now idempotent.
+    private destroyedSockets = new WeakSet<WebSocket>();
 
     constructor(config: PoolConfig) {
         super();
@@ -88,7 +93,9 @@ class WebSocketPool extends EventEmitter {
                 this.connectionAges.set(ws, Date.now());
                 return ws;
             } catch (err) {
-                this.currentTotalConnections--;
+                // NOTE: accounting is owned by destroyConnection (invoked via
+                // the socket's 'close' event / the error handler below).
+                // Decrementing here as well drove the count negative.
                 this.failedConnections++;
                 this.emit('connectionFailed', err);
                 throw err;
@@ -133,6 +140,8 @@ class WebSocketPool extends EventEmitter {
             if (nextRequest.isActive) {
                 nextRequest.isActive = false;
                 clearTimeout(nextRequest.timer);
+                // Refresh the age: the socket is starting a new checkout now.
+                this.connectionAges.set(ws, Date.now());
                 nextRequest.resolve(ws);
                 return;
             }
@@ -161,6 +170,8 @@ class WebSocketPool extends EventEmitter {
 
             ws.once('error', (err) => {
                 clearTimeout(timeout);
+                // Idempotent: the 'close' event that follows will no-op.
+                this.destroyConnection(ws);
                 reject(err);
             });
 
@@ -201,6 +212,9 @@ class WebSocketPool extends EventEmitter {
     }
 
     private destroyConnection(ws: WebSocket): void {
+        if (this.destroyedSockets.has(ws)) return;
+        this.destroyedSockets.add(ws);
+
         const timer = this.heartbeatTimers.get(ws);
         if (timer) {
             clearInterval(timer);

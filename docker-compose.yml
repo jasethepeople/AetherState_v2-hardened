@@ -53,6 +53,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - POSTGRES_URL=postgresql://aetherstate:aetherstate_secret@postgres:5432/aetherstate
       - MCP_PORT=3000
+      - BRIDGE_URL=http://bridge-server:8080
       - LOG_LEVEL=info
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
       - RATE_LIMIT_MAX_REQUESTS=60
